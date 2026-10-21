@@ -8,7 +8,7 @@ Minecraft 自动化黑盒测试框架。服务端插件通过 Plugin Message Cha
 ## 特性
 
 - 112 个 Action（1.21.x），105 个 Action（1.12.2），覆盖 Minecraft 全部 Serverbound 协议包 + 查询 + 复合行为
-- 五端同步支持：Fabric 1.21.11 / NeoForge 1.21.11 / Fabric 1.21.1 / NeoForge 1.21.1 / Forge 1.12.2
+- 六端同步支持：Fabric 1.21.11 / NeoForge 1.21.11 / Fabric 1.21.4 / Fabric 1.21.1 / NeoForge 1.21.1 / Forge 1.12.2
 - 双通道通讯：Plugin Message Channel（服务端→客户端）+ HTTP API（外部工具直连 Mod）
 - 物理引擎驱动的移动系统（InjectedInput），支持碰撞检测与 A* 寻路
 - 截图系统：普通截图 + Tooltip 渲染截图（`screenshot_tooltip`），支持帧缓冲捕获
@@ -33,6 +33,7 @@ Minecraft 自动化黑盒测试框架。服务端插件通过 Plugin Message Cha
 | Minecraft | Mod Loader | JVM |
 |-----------|------------|-----|
 | 1.21.11   | Fabric / NeoForge | 21 |
+| 1.21.4    | Fabric | 21 |
 | 1.21.1    | Fabric / NeoForge | 21 |
 | 1.12.2    | Forge | 8 |
 
@@ -44,6 +45,8 @@ Minecraft 自动化黑盒测试框架。服务端插件通过 Plugin Message Cha
 | `mod:1.21.11:runtime` | 1.21.11 公共运行时核心 | NeoForm + Kotlin |
 | `mod:1.21.11:fabric` | Fabric 1.21.11 平台实现 | Fabric API + fabric-language-kotlin |
 | `mod:1.21.11:neoforge` | NeoForge 1.21.11 平台实现 | NeoForge 21.11.x + KotlinForForge |
+| `mod:1.21.4:runtime` | 1.21.4 共享运行时核心（无 MC 依赖） | Kotlin + SLF4J |
+| `mod:1.21.4:fabric` | Fabric 1.21.4 平台实现 | Fabric API + fabric-language-kotlin |
 | `mod:1.21.1:runtime` | 1.21.1 公共运行时核心 | NeoForm + Kotlin |
 | `mod:1.21.1:fabric` | Fabric 1.21.1 平台实现 | Fabric API + fabric-language-kotlin |
 | `mod:1.21.1:neoforge` | NeoForge 1.21.1 平台实现 | NeoForge 21.1.x + KotlinForForge |
@@ -61,6 +64,9 @@ BlackBoxPro/
 │   │   ├── runtime/           # 公共运行时核心（桥接 + NeoForge MC 实现）
 │   │   ├── fabric/            # Fabric wrapper + Mixin
 │   │   └── neoforge/          # NeoForge wrapper
+│   ├── 1.21.4/
+│   │   ├── runtime/
+│   │   └── fabric/
 │   ├── 1.21.1/
 │   │   ├── runtime/
 │   │   ├── fabric/
@@ -164,6 +170,7 @@ curl -sf http://localhost:38081/status
 |------|------|
 | Fabric 1.21.11 | `mod/1.21.11/fabric/build/libs/BlackBoxPro-fabric-1.21.11-*.jar` |
 | NeoForge 1.21.11 | `mod/1.21.11/neoforge/build/libs/BlackBoxPro-neoforge-1.21.11-*.jar` |
+| Fabric 1.21.4 | `mod/1.21.4/fabric/build/libs/BlackBoxPro-fabric-1.21.4-*.jar` |
 | Fabric 1.21.1 | `mod/1.21.1/fabric/build/libs/BlackBoxPro-fabric-1.21.1-*.jar` |
 | NeoForge 1.21.1 | `mod/1.21.1/neoforge/build/libs/BlackBoxPro-neoforge-1.21.1-*.jar` |
 | Forge 1.12.2 | `mod/1.12.2/build/libs/BlackBoxPro-forge-1.12.2-*.jar` |

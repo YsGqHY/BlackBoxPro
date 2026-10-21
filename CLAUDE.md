@@ -7,7 +7,7 @@ BlackBoxPro 是一个 Minecraft 自动化黑盒测试框架，通过 Plugin Mess
 - 语言：Kotlin，JVM 21（1.21.11 模块）/ JVM 8（1.12.2 模块），`-Xjvm-default=all`
 - 构建工具：Gradle (Kotlin DSL)，多模块项目
 - 包根路径：`com.blackboxpro`
-- Minecraft 版本：1.21.11、1.12.2（多版本架构，模块名含 MC 版本号）
+- Minecraft 版本：1.21.11、1.21.4、1.21.1、1.12.2（多版本架构，模块名含 MC 版本号）
 
 ## 项目结构
 
@@ -19,6 +19,9 @@ BlackBoxPro/                    # 根聚合项目
 │   │   ├── runtime/            # 1.21.11 公共运行时核心（共享桥接 + 当前 NeoForge MC 实现）
 │   │   ├── fabric/             # Fabric wrapper + 平台实现
 │   │   └── neoforge/           # NeoForge wrapper + 平台实现
+│   ├── 1.21.4/                 # 仅接入 Fabric
+│   │   ├── runtime/            # 纯共享桥接层（无 MC 依赖，不引入 NeoForm）
+│   │   └── fabric/             # Fabric wrapper + 平台实现
 │   └── 1.12.2/                 # Forge 1.12.2 独立构建根
 │       ├── runtime/            # 1.12.2 运行时桥接
 │       └── forge/              # 1.12.2 Forge 客户端产物
@@ -39,6 +42,8 @@ BlackBoxPro/                    # 根聚合项目
 | `mod:1.21.11:runtime` | 1.21.11 公共运行时核心 | NeoForm + Kotlin JVM | 无 loader 入口 |
 | `mod:1.21.11:fabric` | Fabric wrapper + 平台实现 | Fabric 1.21.11 + fabric-language-kotlin | `BlackBoxProFabric : ClientModInitializer` |
 | `mod:1.21.11:neoforge` | NeoForge wrapper + 平台实现 | NeoForge 21.11.x + KotlinForForge | `BlackBoxProNeoForge` (`@Mod`) |
+| `mod:1.21.4:runtime` | 1.21.4 共享桥接层（无 MC 依赖，不引入 NeoForm） | Kotlin JVM + SLF4J | 无 loader 入口 |
+| `mod:1.21.4:fabric` | Fabric wrapper + 平台实现 | Fabric 1.21.4 + fabric-language-kotlin | `BlackBoxProFabric : ClientModInitializer` |
 | `mod/1.12.2` | 客户端 Mod | Forge 1.12.2 + Kotlin 1.9.25（独立 Gradle 项目，JDK 8） | `BlackBoxProForge` (`@Mod` object) |
 | `plugin` | 服务端插件 | Paper/Spigot + TabooLib 6.2.4 | `BlackBoxPro : Plugin()` (object) |
 | `common` | 共享协议层 | Kotlin + Gson | 无 MC 入口 |

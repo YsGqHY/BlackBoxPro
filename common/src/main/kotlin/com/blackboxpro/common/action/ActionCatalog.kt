@@ -71,6 +71,11 @@ object ActionCatalog {
         register("player_abilities", "flying")
         register("resource_pack_response", "uuid", "result")
         register("screenshot", "testId", "prefix", "playerName")
+        // 参数以客户端 execute(params, commandId) 为准：
+        //   windowId/slot 必填（requireInt，缺失即 Invalid params）
+        //   testId 默认 "default"、prefix 默认 "tooltip"（params.get(...) ?: 默认值）
+        // 注意：playerName 不是入参——客户端由 RuntimeScreenshotBridge.currentPlayerName() 自行获取
+        register("screenshot_tooltip", "windowId", "slot", "testId", "prefix")
         register("connect_to_server", "ip", "port")
         register("close_screen")
         register("open_inventory")

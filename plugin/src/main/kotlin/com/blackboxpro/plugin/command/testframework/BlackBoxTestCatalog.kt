@@ -3,6 +3,7 @@ package com.blackboxpro.plugin.command.testframework
 import com.blackboxpro.common.action.ActionCatalog
 import com.blackboxpro.common.action.ActionDefinition
 import com.blackboxpro.common.protocol.ResponseMessage
+import com.blackboxpro.common.runtime.screenshot.RuntimeScreenshotBridge
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import java.util.Locale
@@ -49,6 +50,7 @@ object BlackBoxTestCatalog {
         "hover_slot",
         "query_slot_tooltip",
         "query_tooltip_state",
+        "screenshot_tooltip",
         "leave_bed",
         "horse_jump_start",
         "horse_jump_stop",
@@ -105,8 +107,26 @@ object BlackBoxTestCatalog {
         "pathfind_to",
         "navigate_to",
         "break_block",
-        "screenshot"
+        "screenshot",
+        // D2：screenshot_tooltip 现在走"负对照 + 主帧"两个相位（各等 ≥1 渲染帧），
+        // 超时余量是真实的 flake 来源，故与 screenshot 同档
+        "screenshot_tooltip"
     )
+
+    /**
+     * D2（设计 P）主帧**断言判据**的下限。判据 E2 原文：
+     * `|R−B| ≤ 4 ∧ G ≤ R−8 ∧ R ≤ 40`（`audit\d2-pixel-fixtures.py` 对 `audit\` 下 12 张真实帧独立复算）。
+     *
+     * 实测分离度：5 个"有 tooltip"帧为 **1292~2504**；7 个"无 tooltip"帧（含全部负对照）**恒为 0**
+     * ⇒ 阈值 300 的余量 = 4.31×。**阈值的唯一出处是 `RuntimeScreenshotBridge.TOOLTIP_BG_ASSERT_THRESHOLD`**
+     * （下面这行只引用它，不要再写字面量；离线自检引用同一个常量）。
+     *
+     * ⚠️ 不要用严格判据 A（`R,B∈[8,30] ∧ |R−B|≤4 ∧ G≤6`）+ 128 去断言：A 的 `G ≤ 6` 把真正的
+     * vanilla tooltip 背景（`[27,12,27]` G=12、`[23,8,23]` G=8）排除在外，只抓到较暗的一小部分
+     * ⇒ 计数随 tooltip 底下的背景变化，在更亮的面板上可掉到 0 而 tooltip 画得好好的（**假阴性**）。
+     * A 只作诊断字段（`tooltipBgStrict` / `controlTooltipBgStrict`）随响应回传，不参与判定。
+     */
+    private val d2MainThresholdLoose = RuntimeScreenshotBridge.TOOLTIP_BG_ASSERT_THRESHOLD
 
     fun getCategories(): List<String> =
         ActionCatalog.getDefinitions().map { categoryOf(it.id) }.distinct().sorted()
@@ -241,9 +261,20 @@ object BlackBoxTestCatalog {
                                             addProperty("slot", 0)
                                             addProperty("dropStack", false)
                                         }
+                                        "screenshot_tooltip" -> {
+                                            // slot0 已由 openChestInventory 放入 STONE（非空才能取到 tooltip 文本行）
+                                            addProperty("slot", 0)
+                                            addProperty("testId", "catalog_screenshot_tooltip")
+                                            addProperty("prefix", "screenshot_tooltip")
+                                        }
                                     }
                                 }
-                                ctx.sendAction(actionId, actionParams, timeoutMs = 5000L)
+                                // D2：按集合取超时，screenshot_tooltip 走两相位需要更长余量
+                                ctx.sendAction(
+                                    actionId,
+                                    actionParams,
+                                    timeoutMs = if (actionId in longRunningActions) 20000L else 5000L
+                                )
                             }
                         }
                     }
@@ -317,6 +348,17 @@ object BlackBoxTestCatalog {
             // drop_inventory 不需要容器，只需背包有物品（resetBaseline 已放 STONE）
             "drop_inventory" ->
                 CompletableFuture.completedFuture(BlackBoxPrepareResult())
+            // screenshot_tooltip 需同时满足：容器已打开 + 目标槽位非空 + 已完成至少一帧渲染。
+            // 先开箱（BlackBoxFixtureManager.openChestInventory 会在 slot0 放 STONE，满足"非空"），
+            // 再等客户端收到 open_window 包；否则客户端 hover 阶段就会失败。
+            // ⚠️ 仍依赖客户端窗口可交互：窗口最小化时 GLFW 报 0×0，moveCursor 的 coerceIn 会抛异常。
+            "screenshot_tooltip" -> {
+                ctx.mainThread {
+                    fm.openChestInventory()
+                }.thenCompose {
+                    ctx.delay(2000L)  // 与 click_slot 同口径：等待区块加载 + open_window 包到达
+                }.thenApply { BlackBoxPrepareResult() }
+            }
             // 以下需要特殊 GUI（铁砧/信标/村民等），暂跳过
             "click_button", "open_container", "container_transfer",
             "rename_item", "select_trade", "set_beacon_effect", "craft_recipe" ->
@@ -401,6 +443,34 @@ object BlackBoxTestCatalog {
             "query_scoreboard",
             "query_screen_state",
             "query_boss_bar" -> if (data != null && data.size() > 0) null else "查询响应没有返回数据"
+            // ---- D2（设计 P）：tooltip 是否**真的**在截图里的成对判据 ----
+            // 为什么必须成对：`HandledScreen.render` 自身会写 focusedSlot 并可能走 vanilla 的悬停
+            // tooltip 路径，所以"主帧像素 > 0"这一个条件会被 vanilla 骗过（零回归保护价值）；
+            // 负对照帧（同光标、未注入绘制）必须**一个 tooltip 像素都没有**，否则本次比较不可信。
+            "screenshot_tooltip" -> {
+                val d = data
+                if (d == null || d.get("tooltipPixelProbe")?.asString != RuntimeScreenshotBridge.PROBE_OK) {
+                    // 该版本未实现像素探针（字段缺失或 "unsupported"）：退化为 status==success。
+                    // 已知代价：此退化**只能**从结果 JSON 里"字段是否存在"看出，
+                    // run_test 摘要（passed/failed 计数）上看不出强弱，PR 文本须写明。
+                    null
+                } else {
+                    val controlLoose = d.get("controlTooltipBgLoose")?.asInt ?: -1
+                    val mainLoose = d.get("tooltipBgLoose")?.asInt ?: -1
+                    // 严格判据 A 只作诊断（对背景敏感、会假阴性，见 d2MainThresholdLoose 的注释）
+                    val diag = "strict(diag)=${d.get("tooltipBgStrict")?.asInt ?: -1}" +
+                        "/${d.get("controlTooltipBgStrict")?.asInt ?: -1}"
+                    when {
+                        controlLoose != 0 ->
+                            "tooltip 像素负对照被污染：controlTooltipBgLoose=$controlLoose（期望 0）" +
+                                "，本次比较不可信（main=$mainLoose, $diag）"
+                        mainLoose < d2MainThresholdLoose ->
+                            "tooltip 不在截图中：tooltipBgLoose=$mainLoose < $d2MainThresholdLoose" +
+                                "（control=$controlLoose, $diag）"
+                        else -> null
+                    }
+                }
+            }
             else -> null
         }
     }
@@ -578,6 +648,10 @@ object BlackBoxTestCatalog {
         }
         // FX-GUI：需要动态 windowId，execute 时先 query_container_state
         "click_slot", "close_container" -> JsonObject().apply {
+            addProperty("__needWindowId", true)
+        }
+        // screenshot_tooltip：容器界面截图，windowId/slot/testId/prefix 在 __needWindowId 分支内装配
+        "screenshot_tooltip" -> JsonObject().apply {
             addProperty("__needWindowId", true)
         }
         // drop_inventory：从背包指定 slot 丢一个
