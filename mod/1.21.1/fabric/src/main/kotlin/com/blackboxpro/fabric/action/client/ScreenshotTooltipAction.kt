@@ -9,23 +9,49 @@ import com.blackboxpro.fabric.action.ActionResult
 import com.blackboxpro.fabric.util.ContainerTooltipHelper
 import com.blackboxpro.fabric.util.requireInt
 import com.google.gson.JsonObject
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents
 import net.minecraft.client.MinecraftClient
-import net.minecraft.client.gui.DrawContext
 import net.minecraft.client.gui.screen.Screen
 import net.minecraft.client.gui.screen.ingame.HandledScreen
 import net.minecraft.item.Item
 import net.minecraft.item.tooltip.TooltipType
+import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 在容器界面中悬停指定槽位，手动渲染 tooltip 到帧缓冲，然后截图。
- * 1.21.1 使用传统的 DrawContext 即时渲染，不需要 Mixin。
+ * 在容器界面中悬停指定槽位，把 tooltip 画进**真实渲染通道**，再截图。
  *
- * 流程：
- * 1. hoverSlot 移动光标 + 获取 tooltip 数据
- * 2. RuntimeTickScheduler.schedule(1) 延迟 1 tick
- * 3. 手动创建 DrawContext → screen.render() 重绘屏幕 → drawTooltip() 叠加 tooltip → draw() → 截图
+ * 时序（与旧实现的关键差异）：
+ * 1. hoverSlot 移动光标 + 取 tooltip 数据与文本行（不变）。
+ * 2. 用 [ScreenEvents.afterRender] 注册回调，回调里**每帧**用回调传入的**真正的 DrawContext**
+ *    调 `drawTooltip(...)`——绘制发生在真实渲染通道内，会随本帧正常提交进帧缓冲。
+ * 3. 另在 `RuntimeTickScheduler.schedule(1)` 的**下一 tick** 读帧缓冲截图。
+ * 4. 读帧缓冲前即关闭"继续绘制"开关，避免 tooltip 永久叠在真实画面上。
+ *
+ * 为什么不是"回调里立刻截图"：`afterRender` 由 `Screen.renderWithTooltip` 触发，而本帧把几何
+ * 真正提交给 GL 的最后一次 `DrawContext.draw()` 在其**之后**，回调内立刻截图会拍不到刚排入
+ * 缓冲的 tooltip。1.21.1 与 1.21.4 的帧内 `DrawContext.draw()` 次数不同（1.21.1 为 1 次、
+ * 1.21.4 为 2 次），但两版的 `renderWithTooltip` 都早于本帧最后一次 flush，故本设计对两版同样成立。
+ *
+ * 为什么"下一 tick 截图"成立：tick 与渲染在客户端主线程上互斥执行，且回调每帧都在画；
+ * 在客户端正常渲染（至少完成一帧）的前提下，下一 tick 读到的才是"已完成渲染并提交、
+ * 且含 tooltip 的最近一整帧"。异常路径（渲染暂停、屏幕关闭、绘制持续抛异常）不保证能截到
+ * tooltip，由超时分支区分原因后回报。
+ *
+ * 与 1.21.4 修复版的差异只有两点：
+ * - `ActionResult` 用 1.21.1 模块自带的 `com.blackboxpro.fabric.action.ActionResult`
+ *   （1.21.4 走 common 的同名类型）；
+ * - 其余全部同构：`ScreenEvents.afterRender` 由 fabric-screen-api-v1（经 fabric-api 传递依赖）
+ *   提供，1.21.1 与 1.21.4 的 SAM 同为 `afterRender(Screen, DrawContext, int, int, float)`，
+ *   因此**不需要 Mixin，也不需要替换回调**，`build.gradle.kts` 无需改动。
+ *   另外 `Event` 没有 `unregister`，事件挂在 Screen 实例上随屏回收，故用本类自己的布尔量停止绘制。
+ *
+ * 对齐性说明：1.21.1 上"同一渲染时机缺陷"目前只有静态证据（同代 API、与修复前 1.21.4 逐行
+ * 同构的旧写法、同样的"afterRender 早于本帧末次 flush"次序），**尚未在运行期复现确认**。
+ * 因此本改动是与 1.21.4 修复**对齐**的实现，不宣称已修复 1.21.1 的线上缺陷。
  *
  * Action ID: "screenshot_tooltip"
  */
@@ -44,7 +70,7 @@ class ScreenshotTooltipAction : ActionExecutor {
         val screen = client.currentScreen as? HandledScreen<*>
             ?: return ActionResult.fail("No container screen open")
 
-        // 1. hover 移动光标 + 获取 tooltip 数据
+        // 1. hover 移动光标 + 获取 tooltip 数据（不变）
         val hoverState = try {
             ContainerTooltipHelper.hoverSlot(windowId, slotIndex)
         } catch (e: Exception) {
@@ -55,7 +81,7 @@ class ScreenshotTooltipAction : ActionExecutor {
             return ActionResult.fail("Slot $slotIndex is empty, no tooltip to render")
         }
 
-        // 2. 获取 tooltip 文本行
+        // 2. 获取 tooltip 文本行（不变）
         val handler = screen.screenHandler
         val slot = handler.slots[slotIndex]
         val player = client.player ?: return ActionResult.fail("Player not available")
@@ -66,46 +92,130 @@ class ScreenshotTooltipAction : ActionExecutor {
         val mouseX = hoverState.mouseX.toInt()
         val mouseY = hoverState.mouseY.toInt()
 
-        // 3. 延迟 1 tick，手动渲染 + 截图
-        RuntimeTickScheduler.schedule(1) {
+        // drawing：是否继续在渲染回调里画 tooltip（读帧缓冲前一刻置 false）
+        val drawing = AtomicBoolean(true)
+        // drawn：渲染回调是否已画过至少一帧（用于确认"下一 tick 读到的帧含 tooltip"）
+        val drawn = AtomicBoolean(false)
+        // responded：同一 commandId 只发一次响应的守卫（超时分支与截图回调共用同一个 CAS）
+        val responded = AtomicBoolean(false)
+        // lastDrawError：渲染回调内绘制异常的最后一次原因，供超时文案区分"画不上"与"屏幕关了"
+        val lastDrawError = AtomicReference<Throwable?>(null)
+
+        // 3. 绘制进真实渲染通道：afterRender 在 Screen.renderWithTooltip 之后触发，回调给的
+        //    DrawContext 就是本帧 GameRenderer 自己创建并正在使用的那个（不再手工构造）。
+        ScreenEvents.afterRender(screen).register(ScreenEvents.AfterRender { _, drawContext, _, _, _ ->
+            if (!drawing.get()) return@AfterRender
             try {
-                val currentScreen = client.currentScreen as? HandledScreen<*>
-                if (currentScreen == null) {
-                    RuntimeResponseSender.sendResponse(commandId, "failure", "Screen closed before screenshot")
-                    return@schedule
-                }
-
-                // 手动创建 DrawContext（1.21.1 构造函数是 public 的，2 个参数）
-                val drawContext = DrawContext(client, client.bufferBuilders.entityVertexConsumers)
-
-                // 重绘屏幕（partialTick 用 0f，因为在 tick 开始时执行）
-                currentScreen.render(drawContext, mouseX, mouseY, 0f)
-
-                // 叠加 tooltip
                 drawContext.drawTooltip(client.textRenderer, tooltipLines, mouseX, mouseY)
-
-                // flush 渲染命令
-                drawContext.draw()
-
-                // 截图
-                captureScreenshot(commandId, testId, prefix, hoverState)
+                drawn.set(true)
             } catch (e: Exception) {
-                RuntimeResponseSender.sendResponse(commandId, "failure", "Render failed: ${e.message}")
+                // 单帧绘制异常不打断渲染循环；记下最后一次原因，供超时分支给出可判别的文案
+                lastDrawError.compareAndSet(null, e)
             }
-        }
+        })
+
+        // 4. 下一 tick 截图：tick 与渲染在主线程互斥；在正常渲染（≥1 帧完成）的前提下，
+        //    读到的才是含 tooltip 的最近一整帧，异常路径由超时分支区分原因后回报
+        scheduleCapture(
+            client = client,
+            screen = screen,
+            commandId = commandId,
+            testId = testId,
+            prefix = prefix,
+            hoverState = hoverState,
+            drawing = drawing,
+            drawn = drawn,
+            responded = responded,
+            lastDrawError = lastDrawError,
+            attempt = 0
+        )
 
         return ActionResult.async()
+    }
+
+    /**
+     * 排下一次截图尝试，每 tick 检查一次：
+     * - 已画过且仍是同一个屏幕 → 读帧缓冲截图；
+     * - 否则重排，最多 [MAX_RENDER_ATTEMPTS] 次（覆盖"注册后还没渲染过"与"屏幕已关"）；
+     * - 超时则停掉绘制并回 failure，文案按 [lastDrawError] 区分原因；与截图回调共用
+     *   [responded] 守卫，保证只发一次响应。
+     */
+    private fun scheduleCapture(
+        client: MinecraftClient,
+        screen: HandledScreen<*>,
+        commandId: String,
+        testId: String,
+        prefix: String,
+        hoverState: ContainerTooltipHelper.TooltipState,
+        drawing: AtomicBoolean,
+        drawn: AtomicBoolean,
+        responded: AtomicBoolean,
+        lastDrawError: AtomicReference<Throwable?>,
+        attempt: Int
+    ) {
+        RuntimeTickScheduler.schedule(1) {
+            if (responded.get()) return@schedule
+
+            if (drawn.get() && client.currentScreen === screen) {
+                captureScreenshot(commandId, testId, prefix, hoverState, drawing, responded)
+                return@schedule
+            }
+
+            if (attempt + 1 >= MAX_RENDER_ATTEMPTS) {
+                drawing.set(false)
+                val reason = lastDrawError.get()?.let {
+                    " (last draw error: ${it.javaClass.simpleName}: ${it.message})"
+                } ?: " (screen closed, or rendering paused)"
+                if (responded.compareAndSet(false, true)) {
+                    runCatching {
+                        RuntimeResponseSender.sendResponse(
+                            commandId,
+                            "failure",
+                            "Render timeout after $MAX_RENDER_ATTEMPTS ticks: tooltip was not drawn$reason"
+                        )
+                    }.onFailure { logger.error("response send failed for $commandId", it) }
+                }
+                return@schedule
+            }
+
+            scheduleCapture(
+                client = client,
+                screen = screen,
+                commandId = commandId,
+                testId = testId,
+                prefix = prefix,
+                hoverState = hoverState,
+                drawing = drawing,
+                drawn = drawn,
+                responded = responded,
+                lastDrawError = lastDrawError,
+                attempt = attempt + 1
+            )
+        }
     }
 
     private fun captureScreenshot(
         commandId: String,
         testId: String,
         prefix: String,
-        hoverState: ContainerTooltipHelper.TooltipState
+        hoverState: ContainerTooltipHelper.TooltipState,
+        drawing: AtomicBoolean,
+        responded: AtomicBoolean
     ) {
+        // 已决定读取"当前这一帧"：先关掉绘制，避免后续帧继续叠加 tooltip。
+        // 读取本身是同步 takeScreenshot，且渲染与 tick 在主线程互斥，不会读到半帧。
+        // 有意设计：读取失败即终态、不重试——置位在同步读取之前，失败只会直接回 failure，
+        // 不会留下"还在画却已放弃截图"的悬挂状态（将来若要支持重试，需把置位挪到成功之后）。
+        drawing.set(false)
+
         val playerName = RuntimeScreenshotBridge.currentPlayerName() ?: "unknown"
-        val baseDirectory = RuntimeScreenshotBridge.gameDirectory() ?: run {
-            RuntimeResponseSender.sendResponse(commandId, "failure", "Game directory not available")
+        val baseDirectory = RuntimeScreenshotBridge.gameDirectory()
+        if (baseDirectory == null) {
+            if (responded.compareAndSet(false, true)) {
+                runCatching {
+                    RuntimeResponseSender.sendResponse(commandId, "failure", "Game directory not available")
+                }.onFailure { logger.error("response send failed for $commandId", it) }
+            }
             return
         }
         val screenshotConfig = RuntimeBlackBoxConfig.current.screenshot
@@ -129,10 +239,18 @@ class ScreenshotTooltipAction : ActionExecutor {
                         addProperty("fileSize", screenshot.fileSize)
                         addProperty("index", index)
                     }
-                    RuntimeResponseSender.sendResponse(commandId, "success", "Tooltip screenshot saved: $fileName.png", data)
+                    if (responded.compareAndSet(false, true)) {
+                        runCatching {
+                            RuntimeResponseSender.sendResponse(commandId, "success", "Tooltip screenshot saved: $fileName.png", data)
+                        }.onFailure { logger.error("response send failed for $commandId", it) }
+                    }
                 },
                 onFailure = { error ->
-                    RuntimeResponseSender.sendResponse(commandId, "failure", "Screenshot failed: ${error.message}")
+                    if (responded.compareAndSet(false, true)) {
+                        runCatching {
+                            RuntimeResponseSender.sendResponse(commandId, "failure", "Screenshot failed: ${error.message}")
+                        }.onFailure { logger.error("response send failed for $commandId", it) }
+                    }
                 }
             )
         }
@@ -148,7 +266,9 @@ class ScreenshotTooltipAction : ActionExecutor {
     private fun sanitize(name: String): String = name.replace(SANITIZE_PATTERN, "_")
 
     companion object {
+        private val logger = LoggerFactory.getLogger("BlackBoxPro-ScreenshotTooltip")
         private val INDEX_PATTERN = Regex("^(\\d+).*\\.png$")
         private val SANITIZE_PATTERN = Regex("[^a-zA-Z0-9_\\-.]")
+        private const val MAX_RENDER_ATTEMPTS = 20
     }
 }
