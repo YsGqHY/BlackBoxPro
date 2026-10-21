@@ -10,6 +10,18 @@ import java.util.concurrent.CompletableFuture
 
 object BlackBoxTestCatalog {
 
+    /**
+     * 目录内探针聊天文本。
+     *
+     * `click_chat_text` / `query_chat_style` 依赖"聊天栏里已经存在可匹配的文本"，
+     * 因此这两个用例执行前会先补发一条已知消息，把目标顶到 `index = 0`，
+     * 避免依赖历史 index（聊天栏内容会随其它消息漂移）。
+     */
+    private const val CHAT_PROBE_MESSAGE = "[BlackBoxPro] full action test"
+
+    /** 与 [CHAT_PROBE_MESSAGE] 同义的 /me 形式，用于产出带 sender 组件的 chat.type.emote 消息。 */
+    private const val CHAT_PROBE_EMOTE = "me BlackBoxPro full action test"
+
     private val unsupportedOn1122 = setOf(
         "bundle_selected_slot",
         "chunk_batch_received",
@@ -247,6 +259,30 @@ object BlackBoxTestCatalog {
                             }
                         }
                     }
+                    params.has("__needChatProbe") -> {
+                        // 先补发一条已知聊天消息，再把真正要测的 action 发出去，并强制 index = 0 命中刚补发的这条。
+                        // click_chat_text 需要匹配到的组件带 ClickEvent：玩家聊天正文没有 ClickEvent，
+                        // 只有 chat.type.emote 的发送者名组件带 clickEvent(suggest_command)，所以点击用例走 /me。
+                        val forClick = actionId == "click_chat_text"
+                        val setupAction = if (forClick) "chat_command" else "chat_message"
+                        val setupParams = if (forClick) {
+                            JsonObject().apply { addProperty("command", CHAT_PROBE_EMOTE) }
+                        } else {
+                            JsonObject().apply { addProperty("message", CHAT_PROBE_MESSAGE) }
+                        }
+                        ctx.sendAction(setupAction, setupParams, timeoutMs = 5000L)
+                            .thenCompose { ctx.delay(1000L) }
+                            .thenCompose {
+                                val actionParams = JsonObject().apply {
+                                    // 点击用例只能匹配发送者名组件才带 ClickEvent；查询用例匹配正文即可
+                                    addProperty("match", if (forClick) ctx.player.name else CHAT_PROBE_MESSAGE)
+                                    addProperty("index", 0)
+                                    // 关键：客户端 execute 默认 true（会真的点击，可能触发命令/链接），这里必须显式关掉
+                                    if (forClick) addProperty("execute", false)
+                                }
+                                ctx.sendAction(actionId, actionParams, timeoutMs = 5000L)
+                            }
+                    }
                     else -> {
                         val timeout = when (actionId) {
                             "player_move", "player_move_look" -> 15000L
@@ -401,6 +437,17 @@ object BlackBoxTestCatalog {
             "query_scoreboard",
             "query_screen_state",
             "query_boss_bar" -> if (data != null && data.size() > 0) null else "查询响应没有返回数据"
+            // D3：这两个 action 原先只能校验 status，现在额外校验"确实匹配到了东西"
+            "query_chat_style" -> if (data != null && data.has("matched")) null else "未匹配到聊天文本（响应缺少 matched）"
+            "click_chat_text" -> {
+                val d = data
+                when {
+                    d == null || !d.has("matched") || d.get("matched").asString.isNullOrBlank() -> "未匹配到聊天消息"
+                    !d.has("action") || d.get("action").asString.isNullOrBlank() -> "未解析出 ClickEvent 动作"
+                    d.get("executed")?.asBoolean != false -> "click_chat_text 不应执行点击（executed 必须为 false）"
+                    else -> null
+                }
+            }
             else -> null
         }
     }
@@ -439,8 +486,11 @@ object BlackBoxTestCatalog {
             addProperty("sprint", false)
         }
         "sneak_start", "sneak_stop", "sprint_start", "sprint_stop", "jump", "swap_hands", "leave_bed", "drop_item", "drop_item_stack", "perform_respawn" -> JsonObject()
-        "chat_message" -> JsonObject().apply { addProperty("message", "[BlackBoxPro] full action test") }
-        "chat_command" -> JsonObject().apply { addProperty("command", "me BlackBoxPro full test") }
+        "chat_message" -> JsonObject().apply { addProperty("message", CHAT_PROBE_MESSAGE) }
+        "chat_command" -> JsonObject().apply { addProperty("command", CHAT_PROBE_EMOTE) }
+        // D3：这两个 action 的 match 必须指向一条真实存在的聊天消息，
+        // 因此这里只放标记，由 execute 的 __needChatProbe 分支先补发探针消息再执行。
+        "click_chat_text", "query_chat_style" -> JsonObject().apply { addProperty("__needChatProbe", true) }
         "set_carried_item", "creative_set_slot" -> JsonObject().apply { addProperty("slot", 0) }
         "client_information" -> JsonObject().apply {
             addProperty("locale", "zh_cn")
