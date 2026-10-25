@@ -11,7 +11,7 @@ BlackBoxPro 自动化测试部署技能。根据用户指定的版本和模式�
 
 | 文件 | 用途 | 何时读取 |
 |------|------|---------|
-| `reference/action-catalog.md` | 全部 108 个 Action 的 ID、参数、分类快照 | 用户问"有哪些 action"、需要查参数、按分类筛选时 |
+| `reference/action-catalog.md` | Action 的 ID、参数、分类快照（**正文不写死计数**；真值由 `validate_blackboxpro_skills.py` 从源码动态复算，本目录已有 CI 校验） | 用户问"有哪些 action"、需要查参数、按分类筛选时 |
 | `reference/http-api.md` | HTTP 端点格式（请求/响应 JSON 结构） | 需要确认 API 调用格式时 |
 | `reference/register-action.md` | 注册第三方自定义 Action 的完整流程 | 用户要添加新 action、扩展测试能力时 |
 
@@ -660,7 +660,15 @@ curl -s --max-time 8 -X POST http://localhost:38080/execute \
 | 指标 | PASS 条件 |
 |------|----------|
 | 方案 A | 所有执行的 action 响应 `status: "success"` |
-| 方案 B | `run_test` 返回 `failed == 0` |
+| 方案 B | `run_test` 返回 `failed == 0`（**前提：只当作框架链路体检，见下方警告**） |
+
+> ⚠️ **`run_test` 的 `passed/failed` 描述的是"框架 action 在本端能否真正生效"，不等于"用户的插件通过了测试"。**
+>
+> - `run_test` 的用例表在 `BlackBoxTestCatalog` 里**硬编码为 `ActionCatalog` 自测**（`FULL` = `ActionCatalog.getDefinitions().map(::buildCase)`），既不是可扩展的插件测试套件，也不覆盖 `ActionCatalog` 未收录的 action（例如 `screenshot_tooltip`）。
+> - 基线自带环境性失败（实测 `jump` → `Player is not on ground`），所以 `failed == 0` 在本机不是稳定可达的门槛；把 `failed` 当插件缺陷会误判。
+> - 验用户自己的插件必须由宿主 Agent **自编排一串 `/execute`**：`chat_command` 开界面 → `query_container_slots` / `screenshot_tooltip` / `query_chat_style` 断言 → `close_container`。`run_test` 只当链路体检。
+>
+> 「环境未就绪 ≠ 被测程序失败」判别表见 `reference/http-api.md`。
 
 ---
 

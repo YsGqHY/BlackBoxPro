@@ -1,0 +1,37 @@
+name: validate-skills
+
+# 只做一件事：跑 `.claude/skills/validate_blackboxpro_skills.py`。
+# 该脚本纯标准库：不装 pip 包、不跑 gradle、不启 Minecraft、不下载大件。
+# 它的期望值全部从源码现场解析（ActionCatalog.kt + 各端 ActionRegistry.kt），
+# 所以文档一旦漂移（写死计数、漏/多 action、版本差异声明失真）这里就会红。
+
+on:
+  push:
+    branches: [dev-2.0, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-skills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-skills:
+    name: validate .claude skills
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 无需 pip install：脚本只 import re / sys / pathlib
+      - name: Validate skills
+        run: python .claude/skills/validate_blackboxpro_skills.py
